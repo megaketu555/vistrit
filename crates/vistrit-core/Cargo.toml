@@ -1,0 +1,11 @@
+[package]
+name = "vistrit-core"
+version.workspace = true
+edition.workspace = true
+description = "Core types for Vistrit distributed computing platform"
+
+[dependencies]
+serde = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }

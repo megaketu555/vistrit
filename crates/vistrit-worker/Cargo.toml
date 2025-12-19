@@ -1,0 +1,24 @@
+[package]
+name = "vistrit-worker"
+version.workspace = true
+edition.workspace = true
+description = "Worker node for Vistrit distributed computing platform"
+
+[[bin]]
+name = "vistrit-worker"
+path = "src/main.rs"
+
+[dependencies]
+vistrit-core = { workspace = true }
+vistrit-protocol = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+chrono = "0.4"
+futures = "0.3"

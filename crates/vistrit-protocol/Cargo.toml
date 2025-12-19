@@ -1,0 +1,20 @@
+[package]
+name = "vistrit-protocol"
+version.workspace = true
+edition.workspace = true
+description = "Custom binary protocol for Vistrit distributed computing platform"
+
+[dependencies]
+vistrit-core = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+crc32fast = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

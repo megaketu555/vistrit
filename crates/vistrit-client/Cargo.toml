@@ -1,0 +1,29 @@
+[package]
+name = "vistrit-client"
+version.workspace = true
+edition.workspace = true
+description = "Client SDK and CLI for Vistrit distributed computing platform"
+
+[[bin]]
+name = "vistrit"
+path = "src/main.rs"
+
+[lib]
+name = "vistrit_client"
+path = "src/lib.rs"
+
+[dependencies]
+vistrit-core = { workspace = true }
+vistrit-protocol = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = "1.0"
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+futures = "0.3"
+colored = "2.0"
