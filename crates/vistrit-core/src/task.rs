@@ -28,7 +28,12 @@ impl TaskId {
         &self.0
     }
     
-    /// Parse from string
+    /// Get the full UUID string (use this for CLI output that needs to be parseable)
+    pub fn full_id(&self) -> String {
+        self.0.to_string()
+    }
+    
+    /// Parse from string (accepts full UUID)
     pub fn parse(s: &str) -> Result<Self, uuid::Error> {
         Ok(Self(Uuid::parse_str(s)?))
     }

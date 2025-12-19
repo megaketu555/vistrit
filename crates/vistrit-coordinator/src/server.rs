@@ -3,17 +3,17 @@
 //! Handles incoming connections from workers and clients,
 //! processes protocol messages, and coordinates task distribution.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_util::codec::Framed;
 use futures::{SinkExt, StreamExt};
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
-use vistrit_core::{NodeId, NodeInfo, NodeState, Result, VistritError};
+use vistrit_core::{NodeId, NodeInfo, NodeState, Task, Result, VistritError};
 use vistrit_protocol::{
     VistritCodec, Message, PROTOCOL_VERSION,
     messages::*,
@@ -21,6 +21,12 @@ use vistrit_protocol::{
 
 use crate::registry::WorkerRegistry;
 use crate::scheduler::{Scheduler, SchedulingStrategy};
+
+/// Channel for sending tasks to workers
+type TaskSender = mpsc::Sender<Task>;
+
+/// Map of worker ID to their task channel
+type WorkerChannels = Arc<RwLock<HashMap<NodeId, TaskSender>>>;
 
 /// Coordinator server configuration
 pub struct CoordinatorConfig {
@@ -37,6 +43,7 @@ pub struct CoordinatorServer {
     node_info: NodeInfo,
     registry: Arc<WorkerRegistry>,
     scheduler: Arc<Scheduler>,
+    worker_channels: WorkerChannels,
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -61,6 +68,7 @@ impl CoordinatorServer {
         
         let registry = Arc::new(WorkerRegistry::new(config.heartbeat_timeout));
         let scheduler = Arc::new(Scheduler::new(config.scheduling_strategy));
+        let worker_channels = Arc::new(RwLock::new(HashMap::new()));
         
         let (shutdown_tx, _) = broadcast::channel(1);
         
@@ -69,6 +77,7 @@ impl CoordinatorServer {
             node_info,
             registry,
             scheduler,
+            worker_channels,
             shutdown_tx,
         }
     }
@@ -80,7 +89,6 @@ impl CoordinatorServer {
         
         // Spawn background tasks
         let registry = Arc::clone(&self.registry);
-        let heartbeat_timeout = self.config.heartbeat_timeout;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         
         // Heartbeat check task
@@ -98,9 +106,10 @@ impl CoordinatorServer {
             }
         });
         
-        // Scheduler task
+        // Task dispatcher - schedules tasks and sends to workers
         let registry = Arc::clone(&self.registry);
         let scheduler = Arc::clone(&self.scheduler);
+        let worker_channels = Arc::clone(&self.worker_channels);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         
         tokio::spawn(async move {
@@ -110,8 +119,30 @@ impl CoordinatorServer {
                     _ = interval.tick() => {
                         let assignments = scheduler.schedule(&registry);
                         for (task, worker_id) in assignments {
-                            // In a real implementation, we'd send TaskAssign to workers
-                            debug!(task_id = %task.id, worker_id = %worker_id, "Would assign task");
+                            // Send task to the worker
+                            let channels = worker_channels.read().await;
+                            if let Some(tx) = channels.get(&worker_id) {
+                                if let Err(e) = tx.send(task.clone()).await {
+                                    warn!(
+                                        task_id = %task.id,
+                                        worker_id = %worker_id,
+                                        error = %e,
+                                        "Failed to dispatch task to worker"
+                                    );
+                                } else {
+                                    info!(
+                                        task_id = %task.id,
+                                        worker_id = %worker_id,
+                                        "Task dispatched to worker"
+                                    );
+                                }
+                            } else {
+                                warn!(
+                                    task_id = %task.id,
+                                    worker_id = %worker_id,
+                                    "Worker channel not found"
+                                );
+                            }
                         }
                     }
                     _ = shutdown_rx.recv() => {
@@ -125,6 +156,7 @@ impl CoordinatorServer {
         let node_info = Arc::new(self.node_info);
         let registry = Arc::clone(&self.registry);
         let scheduler = Arc::clone(&self.scheduler);
+        let worker_channels = Arc::clone(&self.worker_channels);
         
         loop {
             let (stream, peer_addr) = listener.accept().await?;
@@ -133,6 +165,7 @@ impl CoordinatorServer {
             let node_info = Arc::clone(&node_info);
             let registry = Arc::clone(&registry);
             let scheduler = Arc::clone(&scheduler);
+            let worker_channels = Arc::clone(&worker_channels);
             
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(
@@ -141,6 +174,7 @@ impl CoordinatorServer {
                     node_info,
                     registry,
                     scheduler,
+                    worker_channels,
                 ).await {
                     error!(peer = %peer_addr, error = %e, "Connection error");
                 }
@@ -156,51 +190,81 @@ async fn handle_connection(
     coordinator_info: Arc<NodeInfo>,
     registry: Arc<WorkerRegistry>,
     scheduler: Arc<Scheduler>,
+    worker_channels: WorkerChannels,
 ) -> Result<()> {
     let mut framed = Framed::new(stream, VistritCodec::new());
     let mut node_id: Option<NodeId> = None;
     
-    while let Some(result) = framed.next().await {
-        match result {
-            Ok(message) => {
-                debug!(peer = %peer_addr, msg_type = ?message.message_type(), "Received message");
-                
-                let response = process_message(
-                    message,
-                    &coordinator_info,
-                    &registry,
-                    &scheduler,
-                    &mut node_id,
-                ).await;
-                
-                if let Some(resp) = response {
-                    framed.send(resp).await.map_err(|e| {
-                        VistritError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+    // Create channel for receiving tasks to send to this worker
+    let (task_tx, mut task_rx) = mpsc::channel::<Task>(32);
+    
+    loop {
+        tokio::select! {
+            // Handle incoming messages
+            result = framed.next() => {
+                match result {
+                    Some(Ok(message)) => {
+                        debug!(peer = %peer_addr, msg_type = ?message.message_type(), "Received message");
+                        
+                        let response = process_message(
+                            message,
+                            &coordinator_info,
+                            &registry,
+                            &scheduler,
+                            &mut node_id,
+                            &task_tx,
+                            &worker_channels,
+                        ).await;
+                        
+                        if let Some(resp) = response {
+                            if let Err(e) = framed.send(resp).await {
+                                error!(peer = %peer_addr, error = %e, "Failed to send response");
+                                break;
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        error!(peer = %peer_addr, error = %e, "Protocol error");
+                        
+                        // Send error response
+                        let error_msg = Message::Error(ErrorMessage::new(
+                            ErrorCode::Protocol,
                             e.to_string(),
-                        ))
-                    })?;
+                        ));
+                        let _ = framed.send(error_msg).await;
+                        break;
+                    }
+                    None => {
+                        // Connection closed
+                        info!(peer = %peer_addr, "Connection closed");
+                        break;
+                    }
                 }
             }
-            Err(e) => {
-                error!(peer = %peer_addr, error = %e, "Protocol error");
+            
+            // Send tasks to this worker
+            Some(task) = task_rx.recv() => {
+                info!(
+                    task_id = %task.id,
+                    task_name = %task.name,
+                    "Sending TaskAssign to worker"
+                );
                 
-                // Send error response
-                let error_msg = Message::Error(ErrorMessage::new(
-                    ErrorCode::Protocol,
-                    e.to_string(),
-                ));
-                let _ = framed.send(error_msg).await;
-                
-                break;
+                let assign_msg = Message::TaskAssign(TaskAssignMessage { task });
+                if let Err(e) = framed.send(assign_msg).await {
+                    error!(peer = %peer_addr, error = %e, "Failed to send task assignment");
+                    break;
+                }
             }
         }
     }
     
     // Clean up on disconnect
     if let Some(id) = node_id {
+        // Remove worker channel
+        worker_channels.write().await.remove(&id);
         registry.unregister(&id);
-        info!(node_id = %id, "Node disconnected");
+        info!(node_id = %id, "Node disconnected and cleaned up");
     }
     
     Ok(())
@@ -213,6 +277,8 @@ async fn process_message(
     registry: &WorkerRegistry,
     scheduler: &Scheduler,
     node_id: &mut Option<NodeId>,
+    task_tx: &TaskSender,
+    worker_channels: &WorkerChannels,
 ) -> Option<Message> {
     match message {
         // ─────────────────────────────────────────────────────────────────────
@@ -243,8 +309,13 @@ async fn process_message(
             let id = registry.register(msg.node_info);
             *node_id = Some(id);
             
+            // Register channel for this worker
+            worker_channels.write().await.insert(id, task_tx.clone());
+            
             // Update state to ready
             registry.update_state(&id, NodeState::Ready);
+            
+            info!(node_id = %id, "Worker registered and ready");
             
             Some(Message::HandshakeAck(HandshakeAckMessage {
                 accepted: true,
@@ -274,6 +345,7 @@ async fn process_message(
         
         Message::Disconnect(msg) => {
             info!(node_id = %msg.node_id, reason = %msg.reason, graceful = msg.graceful, "Disconnect");
+            worker_channels.write().await.remove(&msg.node_id);
             registry.unregister(&msg.node_id);
             None // No response needed
         }
@@ -284,6 +356,7 @@ async fn process_message(
         
         Message::TaskSubmit(msg) => {
             let task_id = scheduler.submit(msg.task);
+            info!(task_id = %task_id, "Task submitted to scheduler");
             
             Some(Message::TaskSubmitAck(TaskSubmitAckMessage {
                 request_id: msg.request_id,
@@ -296,12 +369,13 @@ async fn process_message(
         Message::TaskAssignAck(msg) => {
             if msg.accepted {
                 scheduler.mark_running(&msg.task_id, msg.worker_id);
+                info!(task_id = %msg.task_id, worker_id = %msg.worker_id, "Task now running");
             } else {
                 warn!(
                     task_id = %msg.task_id,
                     worker_id = %msg.worker_id,
                     reason = ?msg.reason,
-                    "Task assignment rejected"
+                    "Task assignment rejected - will reschedule"
                 );
                 // Task will be rescheduled automatically
             }
@@ -316,6 +390,12 @@ async fn process_message(
         }
         
         Message::TaskResult(msg) => {
+            info!(
+                task_id = %msg.result.task_id,
+                success = msg.result.success,
+                duration_ms = msg.result.duration_ms,
+                "Task result received"
+            );
             scheduler.complete(msg.result);
             None
         }

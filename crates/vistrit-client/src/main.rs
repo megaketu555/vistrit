@@ -133,7 +133,8 @@ async fn main() -> anyhow::Result<()> {
             match client.submit_task(task).await {
                 Ok(task_id) => {
                     println!("{} Task submitted successfully!", "✅".green());
-                    println!("   Task ID: {}", task_id.to_string().cyan());
+                    println!("   Task ID: {}", task_id.full_id().cyan());
+                    println!("   (Use this ID with 'vistrit status <id>' to check results)");
                 }
                 Err(e) => {
                     eprintln!("{} Failed to submit task: {}", "❌".red(), e);
